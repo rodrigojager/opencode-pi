@@ -1934,6 +1934,36 @@ export async function runOpenCodeTurn(params: {
   return { code, state };
 }
 
+// In-session correction budget for a model that fires one of OpenCode's
+// disabled native tools. OPENCODE_PI_TOOL_RESCUES=0 restores the old
+// fail-fast behaviour.
+function nativeToolRescues(): number {
+  const raw = Number(process.env.OPENCODE_PI_TOOL_RESCUES ?? 2);
+  return Number.isSafeInteger(raw) && raw > 0 ? raw : 0;
+}
+
+/** Rebuild argv with `--session <id>` pointing at the captured OpenCode session. */
+function withSessionId(args: string[], sessionId: string): string[] {
+  const out = args.filter(
+    (arg, index) => arg !== "--session" && args[index - 1] !== "--session",
+  );
+  out.push("--session", sessionId);
+  return out;
+}
+
+/** Corrective follow-up sent inside the same OpenCode session. */
+function buildNativeToolCorrection(tool: string): string {
+  return [
+    `You invoked OpenCode's native "${tool}" tool. OpenCode tools are disabled`,
+    `in this session and nothing from that call reaches Pi.`,
+    `If you need Pi to run a tool, your entire response must contain only one`,
+    `or more tool-call blocks separated by whitespace:`,
+    `<pi_tool_call>{"name":"tool_name","arguments":{}}</pi_tool_call>`,
+    `Use only exact tool names from the earlier tool list. If you can answer`,
+    `without a tool, answer normally.`,
+  ].join("\n");
+}
+
 export function streamOpenCode(
   model: Model<Api>,
   context: Context,
@@ -2052,15 +2082,17 @@ export function streamOpenCode(
       // The timeout is unconditional: a turn is always bounded, even when
       // Pi supplies no timeoutMs (#73).
       const turnTimeoutMs = resolveTurnTimeoutMs(options?.timeoutMs);
-      let turn = await runOpenCodeTurn({
-        args,
-        prompt,
-        cwd: dialect === "v2" ? sessionDir : undefined,
-        signal: options?.signal,
-        timeoutMs: turnTimeoutMs,
-        model,
-        output,
-      });
+      const spawnTurn = (turnArgs: string[], turnPrompt: string) =>
+        runOpenCodeTurn({
+          args: turnArgs,
+          prompt: turnPrompt,
+          cwd: dialect === "v2" ? sessionDir : undefined,
+          signal: options?.signal,
+          timeoutMs: turnTimeoutMs,
+          model,
+          output,
+        });
+      let turn = await spawnTurn(args, prompt);
       // OpenCode's standalone server can resolve `--agent` before it has
       // loaded the project agent file, which fails the turn with "Agent not
       // found". A fresh process gets another chance at the same turn.
@@ -2070,36 +2102,41 @@ export function streamOpenCode(
         !options?.signal?.aborted &&
         isAgentNotFoundError(turn.state.stderr)
       ) {
-        turn = await runOpenCodeTurn({
-          args,
-          prompt,
-          cwd: dialect === "v2" ? sessionDir : undefined,
-          signal: options?.signal,
-          timeoutMs: turnTimeoutMs,
-          model,
-          output,
-        });
+        turn = await spawnTurn(args, prompt);
       }
-      const { code, state } = turn;
-      capturedSessionId = state.sessionId;
 
-      if (options?.signal?.aborted) {
-        throw new Error("Request was aborted");
-      }
-      if (state.timedOut) {
-        throw new Error(`opencode timed out after ${turnTimeoutMs}ms`);
-      }
-      if (code !== 0) {
-        throw new Error(
-          state.stderr.trim() || `opencode exited with code ${code}`,
+      // A model that fires a disabled OpenCode-native tool gets a bounded
+      // corrective follow-up inside the same OpenCode session instead of a
+      // dead turn; only an exhausted budget produces the error.
+      let toolRescues = nativeToolRescues();
+      for (;;) {
+        const { code, state } = turn;
+        capturedSessionId = state.sessionId;
+
+        if (options?.signal?.aborted) {
+          throw new Error("Request was aborted");
+        }
+        if (state.timedOut) {
+          throw new Error(`opencode timed out after ${turnTimeoutMs}ms`);
+        }
+        if (code !== 0) {
+          throw new Error(
+            state.stderr.trim() || `opencode exited with code ${code}`,
+          );
+        }
+        if (state.error) throw new Error(state.error);
+        if (!state.toolUse) break;
+        if (toolRescues-- <= 0 || !capturedSessionId) {
+          throw new Error(
+            `OpenCode attempted to use its disabled native tool (${JSON.stringify(state.toolUse)}). Retry the request; Pi tools must be requested with <pi_tool_call>{"name":"...","arguments":{}}</pi_tool_call> markers.`,
+          );
+        }
+        turn = await spawnTurn(
+          withSessionId(args, capturedSessionId),
+          buildNativeToolCorrection(state.toolUse),
         );
       }
-      if (state.error) throw new Error(state.error);
-      if (state.toolUse) {
-        throw new Error(
-          `OpenCode attempted to use its disabled native tool (${JSON.stringify(state.toolUse)}). Retry the request; Pi tools must be requested with <pi_tool_call>{"name":"...","arguments":{}}</pi_tool_call> markers.`,
-        );
-      }
+      const { state } = turn;
 
       const accumulatedText = state.text;
       const accumulatedThinking = state.thinking;

@@ -23,20 +23,28 @@ import type {
   Model,
 } from "@earendil-works/pi-ai";
 import opencodePiExtension, {
+  agentDefinition,
   cleanupPiSessionState,
+  conversationMessages,
   deleteOpenCodeSession,
   discoverModels,
   imageContentsForModel,
   isActiveModel,
   isFreeModel,
   isToolCallMarkerResponse,
+  normalizeContent,
+  parseApiModels,
   parseModelCost,
+  parseModelList,
   parseToolCallResponse,
   parseToolCalls,
   parseVerboseModels,
   reasoningCliArgs,
+  resolveTurnSystemPrompt,
   resolveTurnTimeoutMs,
+  resolveTurnTools,
   streamOpenCode,
+  showOpenCodePanelList,
   trackedPiSessionCount,
 } from "./index.js";
 
@@ -126,10 +134,11 @@ function restoreEnv(key: string, value: string | undefined): void {
 async function withFakeOpenCode<T>(
   script: string,
   run: () => Promise<T>,
+  version = "opencode v1.0.0",
 ): Promise<T> {
   const dir = mkdtempSync(join(tmpdir(), "opencode-pi-fake-bin-"));
   const binPath = join(dir, "opencode-fake.js");
-  writeFileSync(binPath, `#!/usr/bin/env node\n${script}`, "utf8");
+  writeFileSync(binPath, `#!/usr/bin/env node\nif (process.argv[2] === "--version") { process.stdout.write(${JSON.stringify(version)}); process.exit(0); }\n${script}`, "utf8");
   chmodSync(binPath, 0o755);
 
   const previousBin = process.env.OPENCODE_PI_BIN;
@@ -715,8 +724,140 @@ test("streamOpenCode rejects native OpenCode tool use with marker remediation", 
   );
 });
 
-test("streamOpenCode diagnoses empty provider output with detailed context", async () => {
-  const message = await withFakeOpenCode("", () =>
+test("streamOpenCode continues when OpenCode refused its own tool before it ran", async () => {
+  const message = await withFakeOpenCode(
+    fakeEventScript([
+      {
+        type: "tool_use",
+        part: {
+          tool: "read",
+          state: {
+            status: "error",
+            error:
+              "This non-interactive run cannot ask the user for permission, so the request was rejected.",
+            metadata: { providerCall: { executed: false } },
+          },
+        },
+      },
+      { type: "text", part: { text: "used the Pi read tool instead" } },
+    ]),
+    () => streamOpenCode(fakeModel(), fakeContext(["read"])).result(),
+  );
+
+  assert.equal(message.stopReason, "stop");
+  assert.equal(message.errorMessage, undefined);
+  assert.equal(
+    message.content.some((block) => block.type === "text"),
+    true,
+  );
+});
+
+test("streamOpenCode fails when OpenCode completed a locally executed native tool", async () => {
+  const message = await withFakeOpenCode(
+    fakeEventScript([
+      {
+        type: "tool_use",
+        part: {
+          tool: "read",
+          state: {
+            status: "completed",
+            output: "file contents",
+            metadata: { providerCall: { executed: false } },
+          },
+        },
+      },
+      { type: "text", part: { text: "read it natively" } },
+    ]),
+    () => streamOpenCode(fakeModel(), fakeContext(["read"])).result(),
+  );
+
+  assert.equal(message.stopReason, "error");
+  assert.ok(
+    message.errorMessage?.includes('disabled native tool ("read")'),
+    "a completed tool executed even when providerCall.executed is false",
+  );
+});
+
+test("streamOpenCode fails when a native tool ran and errored with EACCES permission denied", async () => {
+  const message = await withFakeOpenCode(
+    fakeEventScript([
+      {
+        type: "tool_use",
+        part: {
+          tool: "edit",
+          state: {
+            status: "error",
+            error: "EACCES: permission denied, open '/etc/hosts'",
+            metadata: { providerCall: { executed: false } },
+          },
+        },
+      },
+      { type: "text", part: { text: "tried to edit natively" } },
+    ]),
+    () => streamOpenCode(fakeModel(), fakeContext(["read"])).result(),
+  );
+
+  assert.equal(message.stopReason, "error");
+  assert.ok(
+    message.errorMessage?.includes('disabled native tool ("edit")'),
+    "a filesystem permission error is not an OpenCode permission rejection",
+  );
+});
+
+test("streamOpenCode rescues a native tool call with an in-session correction", async () => {
+  const script = `const events = process.argv.includes("--session")
+    ? ${JSON.stringify([{ type: "text", sessionID: "sess-1", part: { text: '<pi_tool_call>{"name":"read","arguments":{"path":"README.md"}}</pi_tool_call>' } }])}
+    : ${JSON.stringify([{ type: "tool_use", sessionID: "sess-1", part: { tool: "bash" } }])};
+    for (const event of events) process.stdout.write(JSON.stringify(event) + "\\n");`;
+  const message = await withFakeOpenCode(script, () =>
+    streamOpenCode(fakeModel(), fakeContext(["read"])).result(),
+  );
+
+  assert.equal(message.stopReason, "toolUse");
+  const call = message.content.find((part) => part.type === "toolCall");
+  assert.equal(call?.type, "toolCall");
+  if (call?.type === "toolCall") {
+    assert.equal(call.name, "read");
+    assert.deepEqual(call.arguments, { path: "README.md" });
+  }
+});
+
+test("streamOpenCode still fails after the native-tool correction budget is spent", async () => {
+  const message = await withFakeOpenCode(
+    fakeEventScript([
+      { type: "tool_use", sessionID: "sess-1", part: { tool: "bash" } },
+    ]),
+    () => streamOpenCode(fakeModel(), fakeContext(["read"])).result(),
+  );
+
+  assert.equal(message.stopReason, "error");
+  assert.equal(
+    message.errorMessage,
+    'OpenCode attempted to use its disabled native tool ("bash"). Retry the request; Pi tools must be requested with <pi_tool_call>{"name":"...","arguments":{}}</pi_tool_call> markers.',
+  );
+});
+
+test("streamOpenCode fails fast on native tool use when correction is disabled", async () => {
+  const previous = process.env.OPENCODE_PI_TOOL_RESCUES;
+  process.env.OPENCODE_PI_TOOL_RESCUES = "0";
+  try {
+    const message = await withFakeOpenCode(
+      fakeEventScript([
+        { type: "tool_use", sessionID: "sess-1", part: { tool: "read" } },
+      ]),
+      () => streamOpenCode(fakeModel(), fakeContext(["read"])).result(),
+    );
+    assert.equal(message.stopReason, "error");
+    assert.ok(
+      message.errorMessage?.includes('disabled native tool ("read")'),
+      "OPENCODE_PI_TOOL_RESCUES=0 restores fail-fast behaviour",
+    );
+  } finally {
+    restoreEnv("OPENCODE_PI_TOOL_RESCUES", previous);
+  }
+});
+
+test("streamOpenCode diagnoses empty provider output with detailed context", async () => {  const message = await withFakeOpenCode("", () =>
     streamOpenCode(fakeModel(), fakeContext()).result(),
   );
 
@@ -908,6 +1049,95 @@ process.stdout.write(JSON.stringify({ type: "text", part: { text: "ok" } }) + "\
   } finally {
     rmSync(captureDir, { recursive: true, force: true });
   }
+});
+
+test("streamOpenCode uses v2 model variants and isolated project agent without v1 flags", async () => {
+  const captureDir = mkdtempSync(join(tmpdir(), "opencode-pi-v2-capture-"));
+  const capturePath = join(captureDir, "invocation.json");
+  const model: Model<Api> = {
+    ...fakeModel(),
+    reasoning: true,
+    thinkingLevelMap: { low: "low" },
+  };
+  try {
+    await withFakeOpenCode(
+      `const fs = require("node:fs");
+fs.writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify({
+  args: process.argv.slice(2),
+  cwd: process.cwd(),
+  pwd: process.env.PWD,
+  agent: fs.readFileSync(".opencode/agents/pi-model.md", "utf8"),
+}));
+process.stdout.write(JSON.stringify({ type: "text", part: { text: "ok" } }) + "\\n");`,
+      async () => {
+        const message = await streamOpenCode(model, fakeContext(), { reasoning: "low" }).result();
+        assert.equal(message.stopReason, "stop");
+      },
+      "opencode v2.0.16",
+    );
+    const invocation = JSON.parse(readFileSync(capturePath, "utf8")) as {
+      args: string[];
+      cwd: string;
+      pwd: string;
+      agent: string;
+    };
+    assert.deepEqual(invocation.args, [
+      "run", "--standalone", "-m", "opencode/fake-free#low",
+      "--agent", "pi-model", "--format", "json", "--thinking",
+    ]);
+    assert.match(invocation.agent, /mode: primary/);
+    // OpenCode v2 uses the ordered `permissions` rule list.
+    assert.match(invocation.agent, /permissions:/);
+    assert.match(invocation.agent, /effect: deny/);
+    assert.equal(invocation.agent.includes("permission:\n"), false);
+    assert.match(invocation.cwd, /opencode-pi-/);
+    // OpenCode resolves its project directory from PWD, so the child has to
+    // see the same directory as its working directory.
+    assert.equal(invocation.pwd, invocation.cwd);
+  } finally {
+    rmSync(captureDir, { recursive: true, force: true });
+  }
+});
+
+test("agentDefinition matches the OpenCode CLI dialect", () => {
+  const v1 = agentDefinition("v1");
+  assert.match(v1, /^permission:\n {2}"\*": deny$/m);
+  assert.match(v1, /^ {2}bash: deny$/m);
+  assert.equal(v1.includes("permissions:"), false);
+
+  const v2 = agentDefinition("v2");
+  assert.match(
+    v2,
+    /^permissions:\n {2}- action: "\*"\n {4}resource: "\*"\n {4}effect: deny\n {2}- action: read\n {4}resource: "\*"\n {4}effect: ask$/m,
+  );
+  assert.equal(v2.includes("permission:\n"), false);
+  assert.equal(v2.includes("bash: deny"), false);
+  // The bridge instructions stay the agent's system prompt in both dialects.
+  assert.match(v1, /<pi_tool_call>/);
+  assert.match(v2, /<pi_tool_call>/);
+});
+
+test("streamOpenCode leaves v2 model ID unsuffixed without a selected variant", async () => {
+  await withFakeOpenCode(
+    `const args = process.argv.slice(2);
+if (args[args.indexOf("-m") + 1] !== "opencode/fake-free") process.exit(1);
+process.stdout.write(JSON.stringify({ type: "text", part: { text: "ok" } }) + "\\n");`,
+    async () => {
+      const message = await streamOpenCode(fakeModel(), fakeContext()).result();
+      assert.equal(message.stopReason, "stop");
+    },
+    "v2.0.16",
+  );
+});
+
+test("streamOpenCode refuses unknown CLI versions rather than guessing v1 flags", async () => {
+  const message = await withFakeOpenCode(
+    `process.exit(1);`,
+    () => streamOpenCode(fakeModel(), fakeContext()).result(),
+    "not a version",
+  );
+  assert.equal(message.stopReason, "error");
+  assert.match(message.errorMessage ?? "", /Cannot determine OpenCode CLI version/);
 });
 
 test("streamOpenCode rejects unsupported image types before provider execution", async () => {
@@ -1448,16 +1678,302 @@ test("discoverModels falls back to live free model IDs when discovery fails", as
     assert.deepEqual(
       models.map((model) => model.id),
       [
-        "opencode/mimo-v2.5-free",
-        "opencode/nemotron-3.5-lightning-free",
-        "opencode/ling-3.0-flash-fin-free",
+        "opencode/beam-free",
         "opencode/big-pickle",
+        "opencode/deepseek-v4.1-flash-free",
+        "opencode/glm-5.3-flash-free",
+        "opencode/longcat-2.5-preview-free",
+        "opencode/mimo-v2.6-flash-free",
+        "opencode/minimax-m3.1-flash-free",
+        "opencode/nemotron-3-ultra-free",
+        "opencode/nemotron-3.5-lightning-free",
+        "opencode/nemotron-3.5-super-vl-free",
       ],
     );
   } finally {
     restoreEnv("OPENCODE_PI_BIN", previousBin);
     restoreEnv("OPENCODE_PI_MODELS", previousModels);
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("parseApiModels reads the v2 /api/model payload for the opencode provider", () => {
+  const models = parseApiModels(
+    JSON.stringify({
+      location: { directory: "/tmp" },
+      data: [
+        {
+          id: "space-bunny-free",
+          modelID: "space-bunny-free",
+          providerID: "opencode",
+          name: "Space Bunny Free",
+          capabilities: { input: ["text", "image"] },
+          variants: [
+            { id: "low", settings: { reasoningEffort: "low" } },
+            { id: "max", settings: { reasoningEffort: "max" } },
+          ],
+          cost: [{ input: 0, output: 0, cache: { read: 0, write: 0 } }],
+          status: "active",
+          limit: { context: 1_048_576, output: 524_288 },
+        },
+        {
+          id: "paid",
+          modelID: "paid",
+          providerID: "opencode",
+          capabilities: { input: ["text"] },
+          cost: [{ input: 3, output: 15, cache: { read: 0.3, write: 0 } }],
+          status: "active",
+        },
+        { modelID: "gpt-astra-latest", providerID: "openrouter", cost: [] },
+        { modelID: "broken" },
+      ],
+    }),
+  );
+
+  assert.deepEqual(
+    models.map((model) => model.id),
+    ["opencode/space-bunny-free", "opencode/paid"],
+  );
+  const free = models[0];
+  assert.equal(free?.name, "Space Bunny Free");
+  assert.equal(free?.image, true);
+  assert.equal(free?.reasoning, true);
+  assert.equal(free?.contextWindow, 1_048_576);
+  assert.equal(free?.maxTokens, 524_288);
+  assert.equal(free?.costFromMetadata, true);
+  assert.deepEqual(free?.thinkingLevelMap, {
+    minimal: null,
+    low: "low",
+    medium: null,
+    high: null,
+    xhigh: "max",
+  });
+  assert.equal(isFreeModel(free!), true);
+  assert.equal(isFreeModel(models[1]!), false);
+  assert.deepEqual(models[1]?.cost, {
+    input: 3,
+    output: 15,
+    cacheRead: 0.3,
+    cacheWrite: 0,
+  });
+});
+
+test("parseApiModels and parseModelList ignore unusable output", () => {
+  assert.deepEqual(parseApiModels("Unrecognized flag: --verbose"), []);
+  assert.deepEqual(parseApiModels("{}"), []);
+  assert.deepEqual(
+    parseModelList(
+      ["opencode/big-pickle", "opencode/space-bunny-free", "opencode/space-bunny-free", "openrouter/x", "", "ERROR"].join("\n"),
+    ),
+    ["opencode/big-pickle", "opencode/space-bunny-free"],
+  );
+});
+
+test("discoverModels prefers the v2 API and ignores the removed --verbose flag", async () => {
+  const previousModels = process.env.OPENCODE_PI_MODELS;
+  const previousBin = process.env.OPENCODE_PI_BIN;
+  delete process.env.OPENCODE_PI_MODELS;
+  const dir = mkdtempSync(join(tmpdir(), "opencode-pi-fake-bin-"));
+  const binPath = join(dir, "opencode-fake.js");
+  writeFileSync(
+    binPath,
+    `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === "api" && args[1] === "GET" && args[2] === "/api/model") {
+  process.stdout.write(JSON.stringify({
+    data: [
+      {
+        modelID: "space-bunny-free",
+        providerID: "opencode",
+        name: "Space Bunny Free",
+        capabilities: { input: ["text"] },
+        cost: [{ input: 0, output: 0, cache: { read: 0, write: 0 } }],
+        status: "active",
+        limit: { context: 1_048_576, output: 524_288 },
+      },
+      {
+        modelID: "paid-model",
+        providerID: "opencode",
+        cost: [{ input: 3, output: 15 }],
+        status: "active",
+      },
+    ],
+  }));
+  process.exit(0);
+}
+if (args[0] === "run") {
+  process.stdout.write(JSON.stringify({ type: "text", part: { text: JSON.stringify(args) } }) + "\\n");
+  process.exit(0);
+}
+process.stderr.write("Unrecognized flag: --verbose in command opencode models\\n");
+process.exit(1);
+`,
+    "utf8",
+  );
+  chmodSync(binPath, 0o755);
+  process.env.OPENCODE_PI_BIN = binPath;
+
+  try {
+    const { models, error } = await discoverModels();
+
+    assert.equal(error, undefined);
+    assert.deepEqual(
+      models.map((model) => model.id),
+      ["opencode/space-bunny-free"],
+    );
+    assert.equal(models[0]?.contextWindow, 1_048_576);
+    // The successful API transport identifies v2 even if --version is unavailable.
+    const message = await streamOpenCode(
+      { ...fakeModel(), id: models[0]!.id, thinkingLevelMap: { low: "low" } },
+      fakeContext(),
+      { reasoning: "low" },
+    ).result();
+    assert.equal(message.stopReason, "stop");
+    const args = JSON.parse((message.content[0] as { text: string }).text) as string[];
+    assert.deepEqual(args.slice(0, 4), ["run", "--standalone", "-m", "opencode/space-bunny-free#low"]);
+    assert.equal(args.includes("--pure"), false);
+  } finally {
+    restoreEnv("OPENCODE_PI_BIN", previousBin);
+    restoreEnv("OPENCODE_PI_MODELS", previousModels);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("discoverModels retries the v2 API when a cold service answers with no models", async () => {
+  const previousModels = process.env.OPENCODE_PI_MODELS;
+  const previousBin = process.env.OPENCODE_PI_BIN;
+  const previousCounter = process.env.OC_TEST_COUNTER;
+  delete process.env.OPENCODE_PI_MODELS;
+  const dir = mkdtempSync(join(tmpdir(), "opencode-pi-fake-bin-"));
+  const binPath = join(dir, "opencode-fake.js");
+  writeFileSync(
+    binPath,
+    `#!/usr/bin/env node
+const args = process.argv.slice(2);
+const counter = process.env.OC_TEST_COUNTER;
+if (args[0] === "api" && args[1] === "GET" && args[2] === "/api/model") {
+  const seen = require("node:fs").existsSync(counter);
+  require("node:fs").writeFileSync(counter, "1");
+  if (!seen) {
+    process.stdout.write(JSON.stringify({ data: [] }));
+    process.exit(0);
+  }
+  process.stdout.write(JSON.stringify({
+    data: [
+      {
+        modelID: "space-bunny-free",
+        providerID: "opencode",
+        cost: [{ input: 0, output: 0 }],
+        status: "active",
+      },
+    ],
+  }));
+  process.exit(0);
+}
+process.exit(1);
+`,
+    "utf8",
+  );
+  chmodSync(binPath, 0o755);
+  process.env.OPENCODE_PI_BIN = binPath;
+  process.env.OC_TEST_COUNTER = join(dir, "called");
+
+  try {
+    const { models, error } = await discoverModels();
+
+    assert.equal(error, undefined);
+    assert.deepEqual(
+      models.map((model) => model.id),
+      ["opencode/space-bunny-free"],
+    );
+  } finally {
+    restoreEnv("OPENCODE_PI_BIN", previousBin);
+    restoreEnv("OPENCODE_PI_MODELS", previousModels);
+    restoreEnv("OC_TEST_COUNTER", previousCounter);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("discoverModels falls back to the plain model ID list when metadata is unavailable", async () => {
+  const previousModels = process.env.OPENCODE_PI_MODELS;
+  const previousBin = process.env.OPENCODE_PI_BIN;
+  delete process.env.OPENCODE_PI_MODELS;
+  const dir = mkdtempSync(join(tmpdir(), "opencode-pi-fake-bin-"));
+  const binPath = join(dir, "opencode-fake.js");
+  writeFileSync(
+    binPath,
+    `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === "api") process.exit(1);
+if (args[0] === "--version") { process.stdout.write("opencode v2.0.16"); process.exit(0); }
+if (args[1] === "--verbose") {
+  process.stderr.write("Unrecognized flag: --verbose in command opencode models\\n");
+  process.exit(1);
+}
+process.stdout.write(["opencode/big-pickle", "opencode/space-bunny-free", "opencode/paid-model"].join("\\n"));
+`,
+    "utf8",
+  );
+  chmodSync(binPath, 0o755);
+  process.env.OPENCODE_PI_BIN = binPath;
+
+  try {
+    const { models, error } = await discoverModels();
+
+    assert.equal(error, undefined);
+    assert.deepEqual(
+      models.map((model) => model.id),
+      ["opencode/big-pickle", "opencode/space-bunny-free"],
+    );
+    assert.equal(models[0]?.costFromMetadata, undefined);
+  } finally {
+    restoreEnv("OPENCODE_PI_BIN", previousBin);
+    restoreEnv("OPENCODE_PI_MODELS", previousModels);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("plain-list discovery selects run flags from the installed CLI version", async () => {
+  const previousModels = process.env.OPENCODE_PI_MODELS;
+  delete process.env.OPENCODE_PI_MODELS;
+  try {
+    for (const [version, expected] of [
+      ["opencode v2.0.16", ["run", "--standalone", "-m", "opencode/space-bunny-free#low", "--agent", "pi-model", "--format", "json", "--thinking"]],
+      ["opencode v1.2.0", ["run", "--pure", "-m", "opencode/space-bunny-free", "--agent", "pi-model", "--format", "json", "--dir"]],
+    ] as const) {
+      await withFakeOpenCode(
+        `const args = process.argv.slice(2);
+if (args[0] === "api" || args.includes("--verbose")) process.exit(1);
+if (args[0] === "models") { process.stdout.write("opencode/space-bunny-free\\n"); process.exit(0); }
+if (args[0] === "run") {
+  process.stdout.write(JSON.stringify({ type: "text", part: { text: JSON.stringify(args) } }) + "\\n");
+  process.exit(0);
+}
+process.exit(1);`,
+        async () => {
+          const { models, error } = await discoverModels();
+          assert.equal(error, undefined);
+          const message = await streamOpenCode(
+            { ...fakeModel(), id: models[0]!.id, thinkingLevelMap: { low: "low" } },
+            fakeContext(),
+            { reasoning: "low" },
+          ).result();
+          assert.equal(message.stopReason, "stop");
+          const args = JSON.parse((message.content[0] as { text: string }).text) as string[];
+          assert.deepEqual(args.slice(0, expected.length), expected);
+          if (version.includes("v2")) {
+            assert.equal(args.includes("--dir"), false);
+            assert.equal(args.includes("--variant"), false);
+            assert.equal(args.includes("--pure"), false);
+          } else {
+            assert.deepEqual(args.slice(-3), ["--thinking", "--variant", "low"]);
+          }
+        },
+        version,
+      );
+    }
+  } finally {
+    restoreEnv("OPENCODE_PI_MODELS", previousModels);
   }
 });
 
@@ -1744,6 +2260,47 @@ test("deleteOpenCodeSession never throws without a session ID", () => {
   assert.doesNotThrow(() => deleteOpenCodeSession(undefined));
 });
 
+test("streamOpenCode retries once when OpenCode cannot resolve the bridge agent", async () => {
+  const captureDir = mkdtempSync(join(tmpdir(), "opencode-pi-capture-"));
+  const counterPath = join(captureDir, "calls");
+  const previousCounter = process.env.OC_TEST_COUNTER;
+  process.env.OC_TEST_COUNTER = counterPath;
+
+  try {
+    const message = await withFakeOpenCode(
+      `const fs = require("node:fs");
+const counter = process.env.OC_TEST_COUNTER;
+const seen = fs.existsSync(counter);
+fs.writeFileSync(counter, "1");
+if (!seen) {
+  process.stderr.write('Agent not found: "pi-model"\\n');
+  process.exit(1);
+}
+process.stdout.write(JSON.stringify({ type: "text", part: { text: "ok" } }) + "\\n");
+`,
+      () => streamOpenCode(fakeModel(), fakeContext()).result(),
+    );
+
+    assert.equal(message.stopReason, "stop");
+    assert.equal(message.errorMessage, undefined);
+  } finally {
+    restoreEnv("OC_TEST_COUNTER", previousCounter);
+    rmSync(captureDir, { recursive: true, force: true });
+  }
+});
+
+test("streamOpenCode reports a persistent agent lookup failure", async () => {
+  const message = await withFakeOpenCode(
+    `process.stderr.write('Agent not found: "pi-model"\\n');
+process.exit(1);
+`,
+    () => streamOpenCode(fakeModel(), fakeContext()).result(),
+  );
+
+  assert.equal(message.stopReason, "error");
+  assert.match(message.errorMessage ?? "", /Agent not found/);
+});
+
 test("cleanupPiSessionState removes the project directory at teardown", async () => {
   const captureDir = mkdtempSync(join(tmpdir(), "opencode-pi-capture-"));
   const capturePath = join(captureDir, "invocations.jsonl");
@@ -1771,4 +2328,508 @@ test("cleanupPiSessionState removes the project directory at teardown", async ()
     await cleanupPiSessionState(piSessionId);
     rmSync(captureDir, { recursive: true, force: true });
   }
+});
+
+test("detail pagination bounds options, traverses duplicates, and preserves exits", async () => {
+  const records = ["Back", "Next", "Close", "Previous", "Back"];
+  const actions = ["detail", ...Array.from({ length: 4 }, () => ["Next", "detail"]).flat(), "Next", ...Array(4).fill("Previous"), "Previous", "Back"];
+  const pages: number[] = [];
+  const result = await showOpenCodePanelList({ ui: { select: async (title: string, options: string[]) => {
+    assert.ok(pages.length < actions.length);
+    const previous = pages.at(-1) ?? 1;
+    const action = actions[pages.length - 1];
+    const page = pages.length === 0 ? 1 : action === "Next" ? Math.min(5, previous + 1) : action === "Previous" ? Math.max(1, previous - 1) : previous;
+    pages.push(page);
+    assert.equal(title, `Details (${page}/5)`);
+    assert.deepEqual(options, [`• ${records[page - 1]}`, ...(page > 1 ? ["Previous"] : []), ...(page < 5 ? ["Next"] : []), "Back", "Close"]);
+    assert.ok(options.length <= 5);
+    return actions[pages.length - 1] === "detail" ? options[0] : actions[pages.length - 1];
+  } } }, "Details", records);
+  assert.equal(result, "back");
+  assert.deepEqual(pages, [1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 5, 4, 3, 2, 1, 1]);
+  for (const [lines, answer, detail, outcome] of [
+    [[], "Back", "No details available.", "back"],
+    [["Close"], "Close", "Close", "close"],
+    [["Previous"], undefined, "Previous", "close"],
+  ] as [string[], string | undefined, string, string][]) {
+    let calls = 0;
+    assert.equal(await showOpenCodePanelList({ ui: { select: async (title: string, options: string[]) => {
+      calls++;
+      assert.equal(title, "Details (1/1)");
+      assert.deepEqual(options, [`• ${detail}`, "Back", "Close"]);
+      return answer;
+    } } }, "Details", lines), outcome);
+    assert.equal(calls, 1);
+  }
+});
+
+test("long ASCII details retain every character in order with short titles and bounded options", async () => {
+  const records = ["Back", "Credentials: managed externally by OpenCode CLI (contents not read)", "Next", "z".repeat(91), "Close"];
+  const segments: string[] = [];
+  await showOpenCodePanelList({ ui: { select: async (title: string, options: string[]) => {
+    assert.ok(title.length <= 38);
+    assert.ok(title.startsWith("opencode-pi configuration ("));
+    assert.ok(options.length <= 5);
+    assert.ok(options[0]?.startsWith("• "));
+    segments.push(options[0]!.slice(2));
+    assert.ok(options[0]!.slice(2).length <= 40);
+    return options.includes("Next") ? "Next" : "Back";
+  } } }, "opencode-pi configuration (environment presence)", records);
+  assert.equal(segments.join(""), records.join(""));
+  assert.deepEqual(segments.slice(0, 2), ["Back", records[1]!.slice(0, 40)]);
+  await showOpenCodePanelList({ ui: { select: async (title: string) => {
+    assert.equal(title, `${"X".repeat(30)} (1/1)`);
+    return undefined;
+  } } }, "X".repeat(80), ["ok"]);
+});
+
+function panelOpenCodeCommand() {
+  type PanelCommand = {
+    handler: (args: string, ctx: unknown) => Promise<void>;
+  };
+  let command: PanelCommand | undefined;
+  return {
+    extension: {
+      registerProvider() {},
+      on() {},
+      registerCommand(name: string, registered: unknown) {
+        if (name === "opencode-pi") command = registered as PanelCommand;
+      },
+    } as unknown as ExtensionAPI,
+    get command(): PanelCommand {
+      if (!command) throw new Error("opencode-pi command was not registered");
+      return command;
+    },
+  };
+}
+
+test("bare opencode-pi uses a cancellable read-only panel without discovery or CLI calls", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "opencode-pi-panel-"));
+  const marker = join(dir, "cli-invoked");
+  const binPath = join(dir, "opencode-panel.js");
+  writeFileSync(
+    binPath,
+    `#!/usr/bin/env node\nrequire("node:fs").writeFileSync(${JSON.stringify(marker)}, "called");\nprocess.stdout.write("opencode v1.0.0");\n`,
+    "utf8",
+  );
+  chmodSync(binPath, 0o755);
+  const previousBin = process.env.OPENCODE_PI_BIN;
+  const previousModels = process.env.OPENCODE_PI_MODELS;
+  process.env.OPENCODE_PI_BIN = binPath;
+  const modelIds = [
+    "auto",
+    "composer-2.5",
+    "opencode/alice.smith",
+    "Users/alice/project",
+    "fake-model-key",
+    "provider/fake-model-key/model",
+    "fake-github-token",
+    "my-secret-token",
+    "bearer-abcdefghijklmnopqrstuvwxyz0123456789",
+    "https://user:password@example.test/token",
+    "user@example.test",
+    "token_0123456789abcdef",
+  ];
+  const secretValues = [
+    ...modelIds,
+    binPath,
+  ];
+  process.env.OPENCODE_PI_MODELS = modelIds.join(",");
+
+  try {
+    const captured = panelOpenCodeCommand();
+    await opencodePiExtension(captured.extension);
+    const selections: { title: string; options: string[] }[] = [];
+    const choices = ["Status (cached)", "Close"];
+    await captured.command.handler("", {
+      mode: "tui",
+      hasUI: true,
+      ui: {
+        async select(title: string, options: string[]) {
+          selections.push({ title, options });
+          return title !== "opencode-pi (read-only)" && options.includes("Next") ? "Next" : choices.shift();
+        },
+        notify() {
+          throw new Error("the read-only panel must not notify");
+        },
+      },
+    });
+
+    assert.ok(selections.length >= 4);
+    assert.ok(selections[0]!.options.includes("Close"));
+    assert.equal(existsSync(marker), false);
+    const statusPanelText = JSON.stringify(selections);
+    const detailText = selections.map(({ options }) => options[0]?.startsWith("• ") ? options[0].slice(2) : "").join("");
+    assert.match(detailText, /Model discovery: configured\/skipped/);
+    assert.match(statusPanelText, new RegExp(`Registered models: ${modelIds.length}`));
+    for (const modelId of modelIds) assert.equal(statusPanelText.includes(modelId), false);
+    for (const secret of secretValues) assert.equal(statusPanelText.includes(secret), false);
+
+    const configSelections: { title: string; options: string[] }[] = [];
+    const configChoices = ["Configuration (environment presence)", "Close"];
+    await captured.command.handler("", {
+      mode: "tui",
+      hasUI: true,
+      ui: {
+        async select(title: string, options: string[]) {
+          configSelections.push({ title, options });
+          return title !== "opencode-pi (read-only)" && options.includes("Next") ? "Next" : configChoices.shift();
+        },
+      },
+    });
+    const configPanelText = JSON.stringify(configSelections);
+    assert.match(configPanelText, /OPENCODE_PI_BIN: set/);
+    assert.match(configPanelText, /OPENCODE_PI_MODELS: set/);
+    for (const secret of secretValues) assert.equal(configPanelText.includes(secret), false);
+  } finally {
+    clearApiProviders();
+    restoreEnv("OPENCODE_PI_BIN", previousBin);
+    restoreEnv("OPENCODE_PI_MODELS", previousModels);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("opencode-pi panel hides configured model IDs, supports cancellation, and preserves non-TUI fallback", async () => {
+  const previousBin = process.env.OPENCODE_PI_BIN;
+  const previousModels = process.env.OPENCODE_PI_MODELS;
+  process.env.OPENCODE_PI_BIN = "/tmp/opencode-panel-secret-bin";
+  const modelIds = [
+    "auto",
+    "composer-2.5",
+    "opencode/alice.smith",
+    "Users/alice/project",
+    "fake-model-key",
+    "provider/fake-model-key/model",
+    "fake-github-token",
+    "my-secret-token",
+    "bearer-abcdefghijklmnopqrstuvwxyz0123456789",
+    "https://user:password@example.test/token",
+    "user@example.test",
+    "token_0123456789abcdef",
+  ];
+  process.env.OPENCODE_PI_MODELS = modelIds.join(",");
+
+  try {
+    const captured = panelOpenCodeCommand();
+    await opencodePiExtension(captured.extension);
+
+    let calls = 0;
+    await captured.command.handler("", {
+      mode: "tui",
+      hasUI: true,
+      ui: {
+        async select() {
+          calls += 1;
+          return undefined;
+        },
+        notify() {
+          throw new Error("cancelled panel must not notify");
+        },
+      },
+    });
+    assert.equal(calls, 1);
+
+    const selections: { title: string; options: string[] }[] = [];
+    const choices = ["Models (cached)", "Close"];
+    await captured.command.handler("", {
+      mode: "tui",
+      hasUI: true,
+      ui: {
+        async select(title: string, options: string[]) {
+          selections.push({ title, options });
+          return title !== "opencode-pi (read-only)" && options.includes("Next") ? "Next" : choices.shift();
+        },
+      },
+    });
+    const panelText = JSON.stringify(selections);
+    assert.match(panelText, new RegExp(`Registered models: ${modelIds.length}`));
+    assert.match(selections.map(({ options }) => options[0]?.startsWith("• ") ? options[0].slice(2) : "").join(""), /IDs hidden to avoid exposing configured values/);
+    for (const modelId of modelIds) assert.equal(panelText.includes(modelId), false);
+
+    const explicitNotifications: string[] = [];
+    let explicitSelectCalls = 0;
+    await captured.command.handler("help", {
+      mode: "tui",
+      hasUI: true,
+      ui: {
+        async select() {
+          explicitSelectCalls += 1;
+          throw new Error("explicit subcommands must not open the panel");
+        },
+        notify(message: string) {
+          explicitNotifications.push(message);
+        },
+      },
+    });
+    assert.equal(explicitSelectCalls, 0);
+    assert.ok(explicitNotifications.some((message) => message.includes("Usage: /opencode-pi")));
+
+    const notifications: string[] = [];
+    calls = 0;
+    for (const mode of ["tui", "print"]) {
+      await captured.command.handler("", {
+        mode,
+        hasUI: false,
+        ui: {
+          async select() {
+            calls += 1;
+            throw new Error("a context without UI must not select");
+          },
+          notify(message: string) {
+            notifications.push(message);
+          },
+        },
+      });
+    }
+    assert.equal(calls, 0);
+    assert.ok(notifications.length > 0);
+  } finally {
+    clearApiProviders();
+    restoreEnv("OPENCODE_PI_BIN", previousBin);
+    restoreEnv("OPENCODE_PI_MODELS", previousModels);
+  }
+});
+
+test("opencode-pi keeps informational rows in detail and supports Back, another section, Close, and Escape", async () => {
+  const previousModels = process.env.OPENCODE_PI_MODELS;
+  process.env.OPENCODE_PI_MODELS = "custom-panel-model";
+
+  try {
+    const captured = panelOpenCodeCommand();
+    await opencodePiExtension(captured.extension);
+    const selections: { title: string; options: string[] }[] = [];
+    const topChoices = ["Status (cached)", "Configuration (environment presence)"];
+    let statusDetailVisits = 0;
+
+    await captured.command.handler("", {
+      mode: "tui",
+      hasUI: true,
+      ui: {
+        async select(title: string, options: string[]) {
+          selections.push({ title, options });
+          if (title === "opencode-pi (read-only)") return topChoices.shift();
+          if (title.startsWith("OpenCode CLI status (cached) (")) {
+            if (statusDetailVisits++ === 0) return options[0];
+            return "Back";
+          }
+          if (title.startsWith("opencode-pi configuration (")) return "Close";
+          throw new Error(`unexpected panel ${title}`);
+        },
+      },
+    });
+
+    assert.deepEqual(selections.map(({ title }) => title), [
+      "opencode-pi (read-only)",
+      "OpenCode CLI status (cached) (1/3)",
+      "OpenCode CLI status (cached) (1/3)",
+      "opencode-pi (read-only)",
+      "opencode-pi configuration (1/2)",
+    ]);
+    assert.ok(selections[1]!.options.includes("Back"));
+    assert.ok(selections[1]!.options.includes("Close"));
+    assert.ok(selections[2]!.options.includes("Back"));
+    assert.ok(selections[4]!.options.includes("Back"));
+    assert.ok(selections[4]!.options.includes("Close"));
+
+    const escapedSelections: { title: string; options: string[] }[] = [];
+    await captured.command.handler("", {
+      mode: "tui",
+      hasUI: true,
+      ui: {
+        async select(title: string, options: string[]) {
+          escapedSelections.push({ title, options });
+          return title === "opencode-pi (read-only)" ? "Models (cached)" : undefined;
+        },
+      },
+    });
+    assert.deepEqual(escapedSelections.map(({ title }) => title), [
+      "opencode-pi (read-only)",
+      "OpenCode models (cached) (1/3)",
+    ]);
+    assert.ok(escapedSelections[1]!.options.includes("Back"));
+    assert.ok(escapedSelections[1]!.options.includes("Close"));
+  } finally {
+    clearApiProviders();
+    restoreEnv("OPENCODE_PI_MODELS", previousModels);
+  }
+});
+
+// A Pi 1.x provider context: the prompt and the tool declarations live in the
+// leading transcript system message, and `context.tools` / `context.systemPrompt`
+// are absent (#140).
+function transcriptContext(options: {
+  systemPrompt?: string;
+  tools?: string[];
+  messages?: unknown[];
+} = {}): Context {
+  const tools = (options.tools ?? []).map((name) => ({
+    name,
+    description: `${name} tool`,
+    parameters: {},
+  }));
+  return {
+    messages: [
+      {
+        role: "system",
+        content: options.systemPrompt ?? "",
+        ...(tools.length > 0 ? { toolsAdded: tools } : {}),
+        timestamp: 0,
+      },
+      ...(options.messages ?? []),
+    ],
+  } as unknown as Context;
+}
+
+test("normalizeContent tolerates null, string, object, and array payloads", () => {
+  assert.deepEqual(normalizeContent(null), []);
+  assert.deepEqual(normalizeContent(undefined), []);
+  assert.deepEqual(normalizeContent(42), []);
+  assert.deepEqual(normalizeContent("hello"), [
+    { type: "text", text: "hello" },
+  ]);
+  assert.deepEqual(normalizeContent({ type: "text", text: "hi" }), [
+    { type: "text", text: "hi" },
+  ]);
+  assert.deepEqual(normalizeContent([null, { type: "text", text: "hi" }]), [
+    { type: "text", text: "hi" },
+  ]);
+});
+
+test("conversationMessages drops the Pi 1.x system messages", () => {
+  const messages = transcriptContext({
+    systemPrompt: "prompt",
+    tools: ["read"],
+    messages: [{ role: "user", content: "hello", timestamp: 1 }],
+  }).messages;
+
+  assert.deepEqual(conversationMessages(messages), [
+    { role: "user", content: "hello", timestamp: 1 },
+  ]);
+});
+
+test("resolveTurnTools reads the declarations from the transcript", () => {
+  assert.deepEqual(
+    resolveTurnTools(transcriptContext({ tools: ["read", "bash"] })).map(
+      (tool) => tool.name,
+    ),
+    ["read", "bash"],
+  );
+
+  // A later system message removes a tool by name.
+  const withRemoval = transcriptContext({ tools: ["read", "bash"] });
+  (withRemoval.messages as unknown[]).push({
+    role: "system",
+    content: "",
+    toolsRemoved: [{ name: "bash" }],
+    timestamp: 1,
+  });
+  assert.deepEqual(
+    resolveTurnTools(withRemoval).map((tool) => tool.name),
+    ["read"],
+  );
+});
+
+test("resolveTurnTools falls back to the legacy context tools", () => {
+  assert.deepEqual(
+    resolveTurnTools(fakeContext(["read"])).map((tool) => tool.name),
+    ["read"],
+  );
+  assert.deepEqual(resolveTurnTools({ messages: [] }), []);
+});
+
+test("resolveTurnSystemPrompt reads the prompt from the transcript", () => {
+  assert.equal(
+    resolveTurnSystemPrompt(
+      transcriptContext({ systemPrompt: "You are a helpful assistant." }),
+    ),
+    "You are a helpful assistant.",
+  );
+
+  // Later system messages append text and patch named sections.
+  const withSections = transcriptContext({ systemPrompt: "base" });
+  (withSections.messages as unknown[]).push({
+    role: "system",
+    content: "extra",
+    sections: { "output-style": "concise" },
+    timestamp: 1,
+  });
+  assert.equal(
+    resolveTurnSystemPrompt(withSections),
+    "base\n\nextra\n\nconcise",
+  );
+
+  // Pi 0.x keeps the prompt on the context.
+  assert.equal(
+    resolveTurnSystemPrompt({
+      systemPrompt: "legacy prompt",
+      messages: [],
+    }),
+    "legacy prompt",
+  );
+});
+
+test("streamOpenCode sends the Pi 1.x tool list and system prompt", async () => {
+  const captureDir = mkdtempSync(join(tmpdir(), "opencode-pi-capture-"));
+  const capturePath = join(captureDir, "invocations.jsonl");
+  try {
+    const message = await withFakeOpenCode(
+      sessionFakeScript(capturePath, "ses-transcript-1"),
+      () =>
+        streamOpenCode(
+          fakeModel(),
+          transcriptContext({
+            systemPrompt: "You are a helpful assistant.",
+            tools: ["read"],
+          }),
+        ).result(),
+    );
+
+    assert.equal(message.stopReason, "stop");
+    const stdin = readInvocations(capturePath)[0]?.stdin ?? "";
+    assert.match(stdin, /# Pi system prompt/);
+    assert.match(stdin, /You are a helpful assistant\./);
+    assert.match(stdin, /"name": "read"/);
+    assert.equal(stdin.includes("No Pi tools are available"), false);
+    // The system prompt is rendered once, not duplicated into the transcript.
+    assert.equal(
+      stdin.split("You are a helpful assistant.").length - 1,
+      1,
+    );
+  } finally {
+    rmSync(captureDir, { recursive: true, force: true });
+  }
+});
+
+test("streamOpenCode allows tools declared only in the Pi 1.x transcript", async () => {
+  const marker =
+    '<pi_tool_call>{"name":"read","arguments":{"path":"README.md"}}</pi_tool_call>';
+  const events = await collectStreamEvents(
+    fakeEventScript([{ type: "text", part: { text: marker } }]),
+    transcriptContext({ tools: ["read"] }),
+  );
+
+  assert.deepEqual(
+    events.map((event) => event.type),
+    ["start", "toolcall_start", "toolcall_delta", "toolcall_end", "done"],
+  );
+});
+
+test("streamOpenCode survives messages with null or non-array content", async () => {
+  const message = await withFakeOpenCode(
+    fakeEventScript([{ type: "text", part: { text: "ok" } }]),
+    () =>
+      streamOpenCode(fakeModel(), {
+        messages: [
+          { role: "user", content: null, timestamp: 1 },
+          { role: "assistant", content: "plain string", timestamp: 2 },
+          {
+            role: "user",
+            content: { type: "text", text: "single object" },
+            timestamp: 3,
+          },
+        ],
+      } as unknown as Context).result(),
+  );
+
+  assert.equal(message.stopReason, "stop");
 });

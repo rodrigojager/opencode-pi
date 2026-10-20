@@ -1,6 +1,6 @@
 {
   "name": "opencode-pi",
-  "version": "1.3.1",
+  "version": "1.5.0",
   "description": "Bridge OpenCode CLI free models into Pi without OpenCode login",
   "type": "module",
   "main": "./src/index.ts",
@@ -33,12 +33,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/rodrigojager/opencode-pi.git"
+    "url": "git+https://github.com/luongnv89/pi-extensions.git"
   },
   "bugs": {
-    "url": "https://github.com/rodrigojager/opencode-pi/issues"
+    "url": "https://github.com/luongnv89/pi-extensions/issues"
   },
-  "homepage": "https://github.com/rodrigojager/opencode-pi",
+  "homepage": "https://github.com/luongnv89/pi-extensions/tree/main/extensions/opencode-pi",
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "^0.75.4",
     "@earendil-works/pi-ai": "^0.75.4"
